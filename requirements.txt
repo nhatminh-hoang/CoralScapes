@@ -8,3 +8,5 @@ tqdm
 matplotlib
 seaborn
 torch-summary
+pytorch-lightning
+tensorboard

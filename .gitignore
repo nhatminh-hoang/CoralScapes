@@ -60,6 +60,7 @@ logs/
 runs/
 wandb/
 tensorboard_logs/
+train_outs/
 
 # OS generated files
 .DS_Store

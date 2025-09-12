@@ -1,200 +1,426 @@
 import os
 
-import tqdm
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.loggers import TensorBoardLogger
+from torchmetrics.segmentation import MeanIoU
+
 from model import UNet
-from utils import ds, num_classes, id2label
+from utils import ds, num_classes, id2label, label2color
 from utils import CoralSegmentationDataset, train_transform, val_transform
-from utils import training_curve, visualize_predictions_with_gt, calculate_miou, calculate_pixel_accuracy
+from utils import training_curve, visualize_predictions_with_gt, calculate_pixel_accuracy
 
-def forward_pass(model, images, masks, criterion, device):
-    images = images.to(device)
-    masks = masks.to(device)
+class CoralSegmentationLightningModule(pl.LightningModule):
+    def __init__(self, in_channels=3, out_channels=40, init_features=64, learning_rate=1e-4, model_name="UNet", batch_size=64):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        # Model
+        self.model = UNet(in_channels=in_channels, out_channels=out_channels, init_features=init_features)
+        
+        # Loss function
+        self.criterion = nn.CrossEntropyLoss()
 
-    outputs = model(images)
-    try:
-        # For CrossEntropyLoss, we need class indices, not one-hot encoded masks
-        mask_indices = torch.argmax(masks, dim=1)  # Convert from one-hot to class indices
-        loss = criterion(outputs, mask_indices)
-    except Exception as e:
-        print("Error computing loss:", e)
-        print("Outputs shape:", outputs.shape)
-        print("Masks shape:", masks.shape)
-        import sys; sys.exit(1)
-
-    return loss, outputs
-
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=45, device='cuda', model_name="UNet"):
-    model.to(device)
-    best_val_loss = float('inf')
-    best_miou = 0.0
+        # Metrics
+        self.miou_metric = MeanIoU(num_classes=num_classes)
+        
+        # Hyperparameters
+        self.learning_rate = learning_rate
+        self.model_name = model_name
+        self.batch_size = batch_size
+        
+        # Metrics tracking for direct saving
+        self.train_losses = []
+        self.val_losses = []
+        self.train_mious = []
+        self.val_mious = []
+        self.train_accuracies = []
+        self.val_accuracies = []
+        self.learning_rates = []  # Track learning rates
+        
+        # Step outputs for epoch aggregation
+        self.train_step_outputs = []
+        self.val_step_outputs = []
+        
+    def forward(self, x):
+        return self.model(x)
     
-    # Initialize tracking lists
-    train_losses = []
-    val_losses = []
-    train_mious = []
-    val_mious = []
-    train_accuracies = []
-    val_accuracies = []
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.99, patience=5
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_miou",
+                "frequency": 1
+            }
+        }
     
-    # Create logs directory
-    log_dir = f"logs/{model_name}_epochs{num_epochs}_lr{optimizer.param_groups[0]['lr']}"
+    def training_step(self, batch, batch_idx):
+        images, masks = batch
+        outputs = self.forward(images)
+        
+        # Convert one-hot encoded masks to class indices for CrossEntropyLoss
+        mask_indices = torch.argmax(masks, dim=1)
+        loss = self.criterion(outputs, mask_indices)
+        
+        # Calculate metrics
+        with torch.no_grad():
+            predictions = torch.argmax(outputs, dim=1)
+            ground_truth = torch.argmax(masks, dim=1)
+            miou = self.miou_metric(predictions, ground_truth)
+            accuracy = calculate_pixel_accuracy(outputs, masks)
+        
+        # Get current learning rate
+        current_lr = self.optimizers().param_groups[0]['lr']
+        
+        # Log metrics
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('train_miou', miou, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('train_accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('learning_rate', current_lr, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        # Store outputs for epoch end
+        self.train_step_outputs.append({
+            'loss': loss.detach().cpu(),
+            'miou': miou.cpu(),
+            'accuracy': accuracy,
+            'lr': current_lr
+        })
+        
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        images, masks = batch
+        outputs = self.forward(images)
+        
+        # Convert one-hot encoded masks to class indices for CrossEntropyLoss
+        mask_indices = torch.argmax(masks, dim=1)
+        loss = self.criterion(outputs, mask_indices)
+        
+        # Calculate metrics
+        with torch.no_grad():
+            predictions = torch.argmax(outputs, dim=1)
+            ground_truth = torch.argmax(masks, dim=1)
+            miou = self.miou_metric(predictions, ground_truth)
+            accuracy = calculate_pixel_accuracy(outputs, masks)
+        
+        # Log metrics
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val_miou', miou, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val_accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # Store outputs for epoch end
+        self.val_step_outputs.append({
+            'loss': loss.detach().cpu(),
+            'miou': miou.cpu(),
+            'accuracy': accuracy
+        })
+        
+        return loss
+    
+    def on_train_epoch_end(self):
+        if not self.train_step_outputs:
+            return
+        
+        # Calculate average metrics for the epoch
+        epoch_loss = torch.stack([x['loss'] for x in self.train_step_outputs]).mean()
+        epoch_miou = sum([x['miou'] for x in self.train_step_outputs]) / len(self.train_step_outputs)
+        epoch_accuracy = sum([x['accuracy'] for x in self.train_step_outputs]) / len(self.train_step_outputs)
+        
+        # Get learning rate (same for all steps in epoch)
+        epoch_lr = self.train_step_outputs[-1]['lr']
+        
+        # Store metrics for visualization
+        self.train_losses.append(epoch_loss.cpu().item())
+        self.train_mious.append(epoch_miou.cpu())
+        self.train_accuracies.append(epoch_accuracy)
+        self.learning_rates.append(epoch_lr)
+        
+        # Clear for next epoch
+        self.train_step_outputs.clear()
+    
+    def on_validation_epoch_end(self):
+        # Calculate epoch averages
+        if self.val_step_outputs:
+            avg_loss = torch.stack([x['loss'] for x in self.val_step_outputs]).mean().item()
+            avg_miou = sum([x['miou'] for x in self.val_step_outputs]) / len(self.val_step_outputs)
+            avg_accuracy = sum([x['accuracy'] for x in self.val_step_outputs]) / len(self.val_step_outputs)
+            
+            # Store metrics
+            self.val_losses.append(avg_loss)
+            self.val_mious.append(avg_miou)
+            self.val_accuracies.append(avg_accuracy)
+            
+            print(f"Validation - Loss: {avg_loss:.4f}, mIoU: {avg_miou:.4f}, Accuracy: {avg_accuracy:.4f}")
+        
+        # Clear outputs
+        self.val_step_outputs.clear()
+    
+    def get_metrics_dict(self):
+        """Get metrics dictionary for direct saving."""
+        return {
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'train_mious': self.train_mious,
+            'val_mious': self.val_mious,
+            'train_accuracies': self.train_accuracies,
+            'val_accuracies': self.val_accuracies,
+            'learning_rates': self.learning_rates,
+        }
+    
+    def predict_step(self, batch, batch_idx):
+        images, masks = batch
+        outputs = self.forward(images)
+        predictions = torch.argmax(outputs, dim=1)
+        return {'predictions': predictions, 'ground_truth': torch.argmax(masks, dim=1), 'images': images}
+
+    def train_dataloader(self):
+        """Create train dataloader."""
+        train_dataset = CoralSegmentationDataset(ds["train"], transform=train_transform, split_name="train")
+        return DataLoader(
+            train_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=True, 
+            num_workers=2,
+            persistent_workers=True
+        )
+    
+    def val_dataloader(self):
+        """Create validation dataloader."""
+        val_dataset = CoralSegmentationDataset(ds["validation"], transform=val_transform, split_name="validation")
+        return DataLoader(
+            val_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False, 
+            num_workers=2,
+            persistent_workers=True
+        )
+    
+    def test_dataloader(self):
+        """Create test dataloader."""
+        test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, split_name="test")
+        return DataLoader(
+            test_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=False, 
+            num_workers=2,
+            persistent_workers=True
+        )
+
+def create_data_loaders(batch_size=64, num_workers=2):
+    """Create train and validation data loaders."""
+    train_dataset = CoralSegmentationDataset(ds["train"], transform=train_transform, split_name="train")
+    val_dataset = CoralSegmentationDataset(ds["validation"], transform=val_transform, split_name="validation")
+    test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, split_name="test")
+    
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers,
+        persistent_workers=True if num_workers > 0 else False
+    )
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        persistent_workers=True if num_workers > 0 else False
+    )
+    test_dataloader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        persistent_workers=True if num_workers > 0 else False
+    )
+    
+    return train_dataloader, val_dataloader, test_dataloader
+
+def train_lightning_model(
+    in_channels=3,
+    out_channels=40,
+    init_features=64,
+    learning_rate=1e-4,
+    batch_size=64,
+    num_epochs=200,
+    model_name="UNet"
+):
+    """Train the model using PyTorch Lightning."""
+    torch.set_float32_matmul_precision('high')
+
+    # Create log directory
+    log_dir = f"logs/{model_name}_features{init_features}_batch{batch_size}_epochs{num_epochs}_lr{learning_rate}"
     os.makedirs(log_dir, exist_ok=True)
+    
+    # Initialize the Lightning module
+    model = CoralSegmentationLightningModule(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        init_features=init_features,
+        learning_rate=learning_rate,
+        model_name=model_name,
+        batch_size=batch_size
+    )
+    _, _, _ = create_data_loaders(batch_size=batch_size, num_workers=2)
+
+    # Callbacks
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=log_dir,
+        filename='best_model',
+        monitor='val_miou',
+        mode='max',
+        save_top_k=1,
+        verbose=True,
+        save_last=True
+    )
+    
+    early_stopping = EarlyStopping(
+        monitor='val_miou',
+        mode='max',
+        patience=num_epochs // 2,
+        verbose=True
+    )
+    
+    # Logger
+    logger = TensorBoardLogger(
+        save_dir=log_dir,
+        name="lightning_logs",
+        version=0
+    )
+    
+    # Trainer
+    trainer = pl.Trainer(
+        max_epochs=num_epochs,
+        callbacks=[checkpoint_callback, early_stopping],
+        logger=logger,
+        devices=-1,
+        num_nodes=1,
+        precision='bf16-mixed' if torch.cuda.is_available() else 32,
+        log_every_n_steps=10,
+        val_check_interval=1.0,
+        check_val_every_n_epoch=1,
+        enable_progress_bar=True,
+        enable_model_summary=True
+    )
     
     print(f"Training {model_name} for {num_epochs} epochs...")
     print(f"Logs will be saved to: {log_dir}")
-
-    for epoch in range(num_epochs):
-        # Training phase
-        model.train()
-        running_loss = 0.0
-        running_miou = 0.0
-        running_accuracy = 0.0
-        num_batches = 0
-        
-        for images, masks in tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
-            optimizer.zero_grad()
-            loss, outputs = forward_pass(model, images, masks, criterion, device)
-
-            loss.backward()
-            optimizer.step()
-
-            # Calculate metrics
-            with torch.no_grad():
-                miou, _ = calculate_miou(outputs, masks, num_classes)
-                accuracy = calculate_pixel_accuracy(outputs, masks)
-            
-            running_loss += loss.item()
-            running_miou += miou
-            running_accuracy += accuracy
-            num_batches += 1
-
-        # Calculate epoch averages
-        epoch_loss = running_loss / num_batches
-        epoch_miou = running_miou / num_batches
-        epoch_accuracy = running_accuracy / num_batches
-        
-        train_losses.append(epoch_loss)
-        train_mious.append(epoch_miou)
-        train_accuracies.append(epoch_accuracy)
-        print(f"  Training - Loss: {epoch_loss:.4f}, mIoU: {epoch_miou:.4f}, Accuracy: {epoch_accuracy:.4f}")
-
-        # Validation phase
-        model.eval()
-        val_running_loss = 0.0
-        val_running_miou = 0.0
-        val_running_accuracy = 0.0
-        val_num_batches = 0
-        
-        with torch.no_grad():
-            for images, masks in val_loader:
-                loss, outputs = forward_pass(model, images, masks, criterion, device)
-                
-                # Calculate metrics
-                miou, _ = calculate_miou(outputs, masks, num_classes)
-                accuracy = calculate_pixel_accuracy(outputs, masks)
-
-                val_running_loss += loss.item()
-                val_running_miou += miou
-                val_running_accuracy += accuracy
-                val_num_batches += 1
-
-        # Calculate validation epoch averages
-        val_epoch_loss = val_running_loss / val_num_batches
-        val_epoch_miou = val_running_miou / val_num_batches
-        val_epoch_accuracy = val_running_accuracy / val_num_batches
-        
-        val_losses.append(val_epoch_loss)
-        val_mious.append(val_epoch_miou)
-        val_accuracies.append(val_epoch_accuracy)
-        
-        print(f"  Validation - Loss: {val_epoch_loss:.4f}, mIoU: {val_epoch_miou:.4f}, Accuracy: {val_epoch_accuracy:.4f}")
-
-        # Save the best model based on mIoU
-        if val_epoch_miou > best_miou:
-            best_miou = val_epoch_miou
-            best_val_loss = val_epoch_loss
-            torch.save(model.state_dict(), f'{log_dir}/best_model.pth')
-            print(f"  ✓ Best model saved (mIoU: {best_miou:.4f})")
-        
-        print("-" * 60)
-
+    print(f"Using device: {trainer.device_ids if trainer.device_ids else 'CPU'}")
+    
+    # Train the model
+    try:
+        trainer.fit(model)
+    except KeyboardInterrupt:
+        print("Training interrupted by user. Proceeding to load the best model and save metrics...")
+    
+    # Load the best model
+    best_model = CoralSegmentationLightningModule.load_from_checkpoint(
+        checkpoint_callback.best_model_path,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        init_features=init_features,
+        learning_rate=learning_rate,
+        model_name=model_name,
+        batch_size=batch_size
+    )
+    
+    # Get metrics directly from the model
+    metrics = model.get_metrics_dict()
+    
+    # Create traditional training curves and save metrics
+    if metrics and metrics['train_losses']:
+        create_traditional_plots(metrics, log_dir)
+    else:
+        print("No metrics available for plotting")
+    
     print("Training complete!")
-    print(f"Best Validation mIoU: {best_miou:.4f}")
+    print(f"Best model saved to: {checkpoint_callback.best_model_path}")
+    print(f"Best Validation mIoU: {metrics.get('best_miou', 0.0):.4f}")
     
-    # Create and save training curves
-    training_curve(train_losses, val_losses, train_mious, val_mious, 
-                  train_accuracies, val_accuracies, save_path=f"{log_dir}/training_curves.png")
+    return best_model, metrics, log_dir
+
+def create_traditional_plots(metrics, log_dir):
+    """Create traditional training curves using existing visualization function and save metrics."""
+    # Create training curves
+    training_curve(
+        metrics['train_losses'],
+        metrics['val_losses'],
+        metrics['train_mious'],
+        metrics['val_mious'],
+        metrics['train_accuracies'],
+        metrics['val_accuracies'],
+        metrics['learning_rates'],
+        save_path=f"{log_dir}/training_curves.png"
+    )
     
-    # Save training metrics to file
-    metrics = {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_mious': train_mious,
-        'val_mious': val_mious,
-        'train_accuracies': train_accuracies,
-        'val_accuracies': val_accuracies,
-        'best_miou': best_miou,
-        'best_val_loss': best_val_loss
-    }
-    
+    # Save metrics for compatibility with existing README update system
     torch.save(metrics, f"{log_dir}/training_metrics.pth")
     print(f"Training metrics saved to {log_dir}/training_metrics.pth")
 
-    return model, metrics, log_dir
-
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    
 
     # Hyperparameters
-    num_epochs = 45
-    learning_rate = 1e-4
-    batch_size = 64
+    num_epochs = 1000
+    learning_rate = 1e-3
+    batch_size = 4
     features = 64  # Initial number of features in UNet
 
-    # Instantiate datasets and dataloaders
-    train_dataset = CoralSegmentationDataset(ds["train"], transform=train_transform)
-    val_dataset = CoralSegmentationDataset(ds["validation"], transform=val_transform)
-
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    # Instantiate model, loss function, and optimizer
-    model = UNet(in_channels=3, out_channels=num_classes, init_features=64).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-
     # Model name for logging
-    model_name = f"UNet_features{features}_batch{batch_size}"
+    model_name = f"UNet"
 
-    # Train the model
-    trained_model, metrics, log_dir = train_model(
-        model, train_dataloader, val_dataloader, criterion, optimizer,
-        num_epochs=num_epochs, device=device, model_name=model_name
+    # Train the model using Lightning
+    trained_model, metrics, log_dir = train_lightning_model(
+        in_channels=3,
+        out_channels=num_classes,
+        init_features=features,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        model_name=model_name
     )
     
-    print(f"\nTraining completed! Results saved in: {log_dir}")
+    print(f"\n✅ Training completed! Results saved in: {log_dir}")
     
     # Generate prediction visualizations with ground truth comparison
-    print("Generating prediction visualizations...")
+    print("📊 Generating prediction visualizations...")
+    
+    # Set model to evaluation mode
+    trained_model.eval()
+    
+    # Create test dataloader for visualization
+    test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, split_name="test")
+    test_dataloader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=2,
+        persistent_workers=True
+    )
+    
     visualize_predictions_with_gt(
-        model=trained_model,
-        dataloader=val_dataloader,
-        device=device,
-        num_samples=8,
+        model=trained_model.model,  # Extract the UNet model from Lightning module
+        dataloader=test_dataloader,
+        device=next(trained_model.parameters()).device,
+        num_samples=3,
         save_path=f"{log_dir}/predictions_vs_gt.png",
-        id2label=id2label
+        id2label=id2label,
+        label2color=label2color
     )
     
     # Automatically update README with best results
-    print("\nUpdating README.md with latest results...")
+    print("\n📝 Updating README.md with latest results...")
     try:
         from update_readme import find_best_experiment, copy_images_to_readme_assets, update_readme
         
@@ -215,3 +441,7 @@ if __name__ == "__main__":
         print("⚠️  update_readme.py not found - skipping automatic README update")
     except Exception as e:
         print(f"⚠️  Error updating README: {e}")
+    
+    print("\n🎉 Lightning training complete!")
+    print(f"📁 Check TensorBoard logs: tensorboard --logdir {log_dir}/lightning_logs")
+    print("=" * 60)
