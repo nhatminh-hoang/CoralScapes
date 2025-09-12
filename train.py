@@ -304,7 +304,6 @@ def train_lightning_model(
         max_epochs=num_epochs,
         callbacks=[checkpoint_callback, early_stopping],
         logger=logger,
-        devices=-1,
         num_nodes=1,
         precision='bf16-mixed' if torch.cuda.is_available() else 32,
         log_every_n_steps=10,
