@@ -12,8 +12,9 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torchmetrics.segmentation import MeanIoU
 
 from model import UNet
+from utils import get_free_vram
 from utils import ds, num_classes, id2label, label2color
-from utils import CoralSegmentationDataset, train_transform, val_transform
+from utils import CoralSegmentationDataset, train_transform, val_transform, augment_transform
 from utils import training_curve, visualize_predictions_with_gt, calculate_pixel_accuracy
 
 class CoralSegmentationLightningModule(pl.LightningModule):
@@ -53,9 +54,7 @@ class CoralSegmentationLightningModule(pl.LightningModule):
     
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.99, patience=5
-        )
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=2)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -67,17 +66,24 @@ class CoralSegmentationLightningModule(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         images, masks = batch
+
+        augmented = augment_transform({"image": images, "mask": masks})
+        images = augmented["image"]
+        masks = augmented["mask"]
+
         outputs = self.forward(images)
+
+        # Handle mask format - masks should be class indices for CrossEntropyLoss
+        if len(masks.shape) == 4:
+            masks = masks.squeeze(1)  # Remove channel dimension if present
+        masks = masks.long()
         
-        # Convert one-hot encoded masks to class indices for CrossEntropyLoss
-        mask_indices = torch.argmax(masks, dim=1)
-        loss = self.criterion(outputs, mask_indices)
+        loss = self.criterion(outputs, masks)
         
         # Calculate metrics
         with torch.no_grad():
             predictions = torch.argmax(outputs, dim=1)
-            ground_truth = torch.argmax(masks, dim=1)
-            miou = self.miou_metric(predictions, ground_truth)
+            miou = self.miou_metric(predictions, masks)
             accuracy = calculate_pixel_accuracy(outputs, masks)
         
         # Get current learning rate
@@ -103,15 +109,17 @@ class CoralSegmentationLightningModule(pl.LightningModule):
         images, masks = batch
         outputs = self.forward(images)
         
-        # Convert one-hot encoded masks to class indices for CrossEntropyLoss
-        mask_indices = torch.argmax(masks, dim=1)
-        loss = self.criterion(outputs, mask_indices)
+        # Handle mask format - masks should be class indices for CrossEntropyLoss
+        if len(masks.shape) == 4:
+            masks = masks.squeeze(1)  # Remove channel dimension if present
+        masks = masks.long()
+        
+        loss = self.criterion(outputs, masks)
         
         # Calculate metrics
         with torch.no_grad():
             predictions = torch.argmax(outputs, dim=1)
-            ground_truth = torch.argmax(masks, dim=1)
-            miou = self.miou_metric(predictions, ground_truth)
+            miou = self.miou_metric(predictions, masks)
             accuracy = calculate_pixel_accuracy(outputs, masks)
         
         # Log metrics
@@ -182,11 +190,16 @@ class CoralSegmentationLightningModule(pl.LightningModule):
         images, masks = batch
         outputs = self.forward(images)
         predictions = torch.argmax(outputs, dim=1)
-        return {'predictions': predictions, 'ground_truth': torch.argmax(masks, dim=1), 'images': images}
+        
+        # Handle mask format consistently
+        if len(masks.shape) == 4:
+            masks = masks.squeeze(1)  # Remove channel dimension if present
+        
+        return {'predictions': predictions, 'ground_truth': masks, 'images': images}
 
     def train_dataloader(self):
         """Create train dataloader."""
-        train_dataset = CoralSegmentationDataset(ds["train"], transform=train_transform, split_name="train")
+        train_dataset = CoralSegmentationDataset(ds["train"], transform=train_transform)
         return DataLoader(
             train_dataset, 
             batch_size=self.batch_size, 
@@ -197,7 +210,7 @@ class CoralSegmentationLightningModule(pl.LightningModule):
     
     def val_dataloader(self):
         """Create validation dataloader."""
-        val_dataset = CoralSegmentationDataset(ds["validation"], transform=val_transform, split_name="validation")
+        val_dataset = CoralSegmentationDataset(ds["validation"], transform=val_transform)
         return DataLoader(
             val_dataset, 
             batch_size=self.batch_size, 
@@ -208,7 +221,7 @@ class CoralSegmentationLightningModule(pl.LightningModule):
     
     def test_dataloader(self):
         """Create test dataloader."""
-        test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, split_name="test")
+        test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform)
         return DataLoader(
             test_dataset, 
             batch_size=self.batch_size, 
@@ -216,36 +229,6 @@ class CoralSegmentationLightningModule(pl.LightningModule):
             num_workers=2,
             persistent_workers=True
         )
-
-def create_data_loaders(batch_size=64, num_workers=2):
-    """Create train and validation data loaders."""
-    train_dataset = CoralSegmentationDataset(ds["train"], transform=train_transform, split_name="train")
-    val_dataset = CoralSegmentationDataset(ds["validation"], transform=val_transform, split_name="validation")
-    test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, split_name="test")
-    
-    train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False
-    )
-    val_dataloader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False
-    )
-    test_dataloader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False
-    )
-    
-    return train_dataloader, val_dataloader, test_dataloader
 
 def train_lightning_model(
     in_channels=3,
@@ -262,6 +245,12 @@ def train_lightning_model(
     # Create log directory
     log_dir = f"logs/{model_name}_features{init_features}_batch{batch_size}_epochs{num_epochs}_lr{learning_rate}"
     os.makedirs(log_dir, exist_ok=True)
+
+    while get_free_vram()[0] < 10000 and torch.cuda.is_available():
+        print("Waiting for GPU memory...")
+        torch.cuda.empty_cache()
+        import time
+        time.sleep(300)
     
     # Initialize the Lightning module
     model = CoralSegmentationLightningModule(
@@ -272,22 +261,21 @@ def train_lightning_model(
         model_name=model_name,
         batch_size=batch_size
     )
-    _, _, _ = create_data_loaders(batch_size=batch_size, num_workers=2)
 
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
         dirpath=log_dir,
         filename='best_model',
-        monitor='val_miou',
-        mode='max',
+        monitor='val_loss',
+        mode='min',
         save_top_k=1,
         verbose=True,
         save_last=True
     )
     
     early_stopping = EarlyStopping(
-        monitor='val_miou',
-        mode='max',
+        monitor='val_loss',
+        mode='min',
         patience=num_epochs // 2,
         verbose=True
     )
@@ -310,7 +298,7 @@ def train_lightning_model(
         val_check_interval=1.0,
         check_val_every_n_epoch=1,
         enable_progress_bar=True,
-        enable_model_summary=True
+        enable_model_summary=False,
     )
     
     print(f"Training {model_name} for {num_epochs} epochs...")
@@ -318,10 +306,10 @@ def train_lightning_model(
     print(f"Using device: {trainer.device_ids if trainer.device_ids else 'CPU'}")
     
     # Train the model
-    try:
-        trainer.fit(model)
-    except KeyboardInterrupt:
-        print("Training interrupted by user. Proceeding to load the best model and save metrics...")
+    # try:
+    #     trainer.fit(model)
+    # except KeyboardInterrupt:
+    #     print("Training interrupted by user. Proceeding to load the best model and save metrics...")
     
     # Load the best model
     best_model = CoralSegmentationLightningModule.load_from_checkpoint(
@@ -373,7 +361,7 @@ if __name__ == "__main__":
     # Hyperparameters
     num_epochs = 1000
     learning_rate = 1e-3
-    batch_size = 4
+    batch_size = 32
     features = 64  # Initial number of features in UNet
 
     # Model name for logging
@@ -399,7 +387,7 @@ if __name__ == "__main__":
     trained_model.eval()
     
     # Create test dataloader for visualization
-    test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, split_name="test")
+    test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, split="test")
     test_dataloader = DataLoader(
         test_dataset, 
         batch_size=batch_size, 

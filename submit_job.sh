@@ -1,14 +1,14 @@
 #!/bin/bash
 
 #SBATCH --job-name=SSP_CoralScapes
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 
 #SBATCH --partition=gpu
-#SBATCH --gpus=2
-#SBATCH --nodelist=hpc[23,24]
+#SBATCH --gpus=1
+#SBATCH --nodelist=hpc24
 #SBATCH --cpus-per-task=20
-#SBATCH --mem-per-gpu=20G
+#SBATCH --mem-per-gpu=100G
 
 #SBATCH --output=train_outs/gpu/out/%x.%j.out
 #SBATCH --error=train_outs/gpu/errors/%x.%j.err
@@ -19,4 +19,4 @@ conda init bash
 source ~/.bashrc
 conda activate gpu_11.8
 
-srun python train.py --gpus 2
+srun python train.py

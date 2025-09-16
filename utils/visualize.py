@@ -385,11 +385,14 @@ def visualize_predictions_with_gt(model, dataloader, device, num_samples=8, save
             images = images.to(device)
             outputs = model(images)
             predictions = torch.argmax(outputs, dim=1)
-            gt_classes = torch.argmax(masks, dim=1)
             
-            correct = (predictions.cpu() == gt_classes).sum().item()
+            # Handle mask format consistently
+            if len(masks.shape) == 4:
+                masks = masks.squeeze(1)  # Remove channel dimension if present
+            
+            correct = (predictions.cpu() == masks).sum().item()
             total_correct += correct
-            total_pixels += gt_classes.numel()
+            total_pixels += masks.numel()
         
         overall_accuracy = total_correct / total_pixels
         fig.suptitle(f'Predictions vs Ground Truth (Overall Accuracy: {overall_accuracy:.4f})', 
