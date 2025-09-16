@@ -323,11 +323,10 @@ def visualize_predictions_with_gt(model, dataloader, device, num_samples=8, save
                 
                 # Get individual image, mask, and prediction
                 image = images[i].cpu()
-                gt_mask = torch.argmax(masks[i], dim=0).cpu().numpy()
+                gt_mask = masks[i].permute(1,2,0).cpu().numpy()
                 pred_mask = predictions[i].cpu().numpy()
                 
                 # Denormalize image for visualization
-                image = image * torch.tensor([0.200, 0.194, 0.198]).view(3, 1, 1) + torch.tensor([0.306, 0.508, 0.491]).view(3, 1, 1)
                 image = torch.clamp(image, 0, 1)
                 image = image.permute(1, 2, 0).numpy()
                 

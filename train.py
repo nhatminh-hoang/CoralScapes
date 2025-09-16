@@ -266,16 +266,16 @@ def train_lightning_model(
     checkpoint_callback = ModelCheckpoint(
         dirpath=log_dir,
         filename='best_model',
-        monitor='val_loss',
-        mode='min',
+        monitor='val_miou',
+        mode='max',
         save_top_k=1,
         verbose=True,
         save_last=True
     )
     
     early_stopping = EarlyStopping(
-        monitor='val_loss',
-        mode='min',
+        monitor='val_miou',
+        mode='max',
         patience=num_epochs // 2,
         verbose=True
     )
@@ -306,10 +306,10 @@ def train_lightning_model(
     print(f"Using device: {trainer.device_ids if trainer.device_ids else 'CPU'}")
     
     # Train the model
-    # try:
-    #     trainer.fit(model)
-    # except KeyboardInterrupt:
-    #     print("Training interrupted by user. Proceeding to load the best model and save metrics...")
+    try:
+        trainer.fit(model)
+    except KeyboardInterrupt:
+        print("Training interrupted by user. Proceeding to load the best model and save metrics...")
     
     # Load the best model
     best_model = CoralSegmentationLightningModule.load_from_checkpoint(

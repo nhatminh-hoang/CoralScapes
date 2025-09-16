@@ -14,7 +14,7 @@ try:
 except:
     from setup import ds
 
-SIZE = (512, 1024)  # Resize images to 128x256
+SIZE = (128, 256)  # Resize images to 128x256
 
 class CoralSegmentationDataset(Dataset):
     def __init__(self, dataset, transform=None, pre_compute=True, split="Unknown"):
@@ -151,9 +151,12 @@ if __name__ == "__main__":
             # Augmentation
             augmented = augment_transform({"image": images, "mask": masks})
             images = augmented["image"]
-            masks = augmented["mask"]
-            print(f"Batch {batch_idx+1}: images shape: {images.shape}, masks shape: {masks.shape}")
+            masks = augmented["mask"].float()
 
+        print(f"image shape: {images.shape}")
         print(f"image min: {images.min().item():.4f}, image max: {images.max().item():.4f}, image mean: {images.mean().item():.4f}, image std: {images.std().item():.4f}")
+        print(f"mask shape: {masks.squeeze(1).shape}")
+        print(f"mask min: {masks.min().item():.4f}, mask max: {masks.max().item():.4f}, mask mean: {masks.mean().item():.4f}, mask std: {masks.std().item():.4f}")
+
     end_time = time.time()
     print(f"Time taken for one epoch: {end_time - start_time:.2f} seconds")
