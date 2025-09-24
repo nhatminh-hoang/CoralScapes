@@ -7,19 +7,26 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2 as transforms
 from torchvision.transforms import InterpolationMode
 from torchvision import tv_tensors
-import numpy as np
 
 try:
     from utils import ds
 except:
     from setup import ds
 
+# Default size - will be overridden by config
 SIZE = (128, 256)  # Resize images to 128x256
+processor = None  # to be set from setup.py if available
 
 class CoralSegmentationDataset(Dataset):
-    def __init__(self, dataset, transform=None, pre_compute=True, split="Unknown"):
+    def __init__(self, dataset, transform=None, pre_compute=True, split="Unknown", config=None):
         self.dataset = dataset
         self.pre_compute = pre_compute
+        self.config = config
+        
+        # Update SIZE from config if provided
+        global SIZE
+        if config and hasattr(config, 'dataset') and hasattr(config.dataset, 'input_size'):
+            SIZE = tuple(config.dataset.input_size)
 
         if self.pre_compute:
             self.transform = transform
@@ -75,51 +82,151 @@ class CoralSegmentationDataset(Dataset):
         return image, mask
 
 # Define transformations
-# Use the calculated mean and std from previous steps
 
-train_transform = transforms.Compose([
-    transforms.Resize(SIZE),
-    transforms.ToTensor(),  # Convert PIL image to tensor
-])
+def make_transform(resize_size, config=None):
+    if isinstance(resize_size, int):
+        resize_size = (resize_size, resize_size)
 
-augment_transform = transforms.Compose([
-    transforms.RandomCrop(SIZE),
-    transforms.RandomHorizontalFlip(),  # Data augmentation (applied during __getitem__)
-    transforms.RandomApply([transforms.RandomAffine(degrees=20, translate=(0.05, 0.05),
-                                  interpolation=InterpolationMode.BILINEAR)], p=0.5),
-])
+    to_tensor = transforms.ToImage()
+    resize = transforms.Resize((resize_size[0], resize_size[1]), antialias=True)
+    to_float = transforms.ToDtype(torch.float32, scale=True)
+    
+    # Use normalization from config if provided
+    if config and hasattr(config, 'dataset') and hasattr(config.dataset, 'normalization'):
+        normalize = transforms.Normalize(
+            mean=config.dataset.normalization['mean'],
+            std=config.dataset.normalization['std'],
+        )
+    else:
+        normalize = transforms.Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        )
+    return transforms.Compose([to_tensor, resize, to_float, normalize])
 
-val_transform = transforms.Compose([
-    transforms.Resize(SIZE, interpolation=InterpolationMode.BILINEAR, antialias=True),
-    transforms.ToTensor(),  # Convert PIL image to tensor
-])
+def create_augmentation_transforms(config=None):
+    """Create augmentation transforms based on config."""
+    global SIZE
+    
+    if config and hasattr(config, 'augmentation') and config.augmentation.train.get('enable', True):
+        aug_config = config.augmentation.train
+        
+        augment_img_transforms = []
+        augment_mask_transforms = []
+        
+        # Random crop
+        if aug_config.get('random_crop', {}).get('enable', True):
+            crop_size = aug_config.get('random_crop', {}).get('size', [SIZE[0], SIZE[0]])
+            augment_img_transforms.append(transforms.RandomCrop(crop_size))
+            augment_mask_transforms.append(transforms.RandomCrop(crop_size))
+        
+        # Random horizontal flip
+        if aug_config.get('random_horizontal_flip', {}).get('enable', True):
+            prob = aug_config.get('random_horizontal_flip', {}).get('probability', 0.5)
+            augment_img_transforms.append(transforms.RandomHorizontalFlip(p=prob))
+            augment_mask_transforms.append(transforms.RandomHorizontalFlip(p=prob))
+        
+        # Random affine
+        if aug_config.get('random_affine', {}).get('enable', True):
+            affine_config = aug_config.get('random_affine', {})
+            prob = affine_config.get('probability', 0.5)
+            degrees = affine_config.get('degrees', 20)
+            translate = affine_config.get('translate', [0.05, 0.05])
+            
+            augment_img_transforms.append(
+                transforms.RandomApply([
+                    transforms.RandomAffine(
+                        degrees=degrees, 
+                        translate=translate,
+                        interpolation=InterpolationMode.BILINEAR
+                    )
+                ], p=prob)
+            )
+            augment_mask_transforms.append(
+                transforms.RandomApply([
+                    transforms.RandomAffine(
+                        degrees=degrees, 
+                        translate=translate,
+                        interpolation=InterpolationMode.NEAREST
+                    )
+                ], p=prob)
+            )
+        
+        augment_img = transforms.Compose(augment_img_transforms)
+        augment_mask = transforms.Compose(augment_mask_transforms)
+    else:
+        # Default augmentation
+        augment_img = transforms.Compose([
+            transforms.RandomCrop((SIZE[0], SIZE[0])),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([transforms.RandomAffine(degrees=20, translate=(0.05, 0.05),
+                                          interpolation=InterpolationMode.BILINEAR)], p=0.5),
+        ])
 
-def create_data_loaders(batch_size=64, num_workers=2):
+        augment_mask = transforms.Compose([
+            transforms.RandomCrop((SIZE[0], SIZE[0])),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([transforms.RandomAffine(degrees=20, translate=(0.05, 0.05),
+                                          interpolation=InterpolationMode.NEAREST)], p=0.5),
+        ])
+    
+    return augment_img, augment_mask
+
+transform = make_transform(resize_size=SIZE)
+augment_img, augment_mask = create_augmentation_transforms()
+
+def create_data_loaders(batch_size=64, num_workers=2, config=None):
     """Create train and validation data loaders."""
-    train_dataset = CoralSegmentationDataset(ds["train"], transform=train_transform, pre_compute=True, split="train")
-    val_dataset = CoralSegmentationDataset(ds["validation"], transform=val_transform, pre_compute=True, split="validation")
-    test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, pre_compute=True, split="test")
+    # Hardcoded defaults for dataloader settings
+    DEFAULT_NUM_WORKERS = 4
+    DEFAULT_PIN_MEMORY = True
+    DEFAULT_PERSISTENT_WORKERS = True
+    
+    # Use config values if provided, otherwise use defaults
+    if config:
+        batch_size = config.training.batch_size if hasattr(config, 'training') else batch_size
+        num_workers = DEFAULT_NUM_WORKERS
+        pin_memory = DEFAULT_PIN_MEMORY
+        persistent_workers = DEFAULT_PERSISTENT_WORKERS
+        
+        # Update global augmentation transforms
+        global augment_img, augment_mask
+        augment_img, augment_mask = create_augmentation_transforms(config)
+        
+        # Update transform with config
+        global transform
+        transform = make_transform(resize_size=SIZE, config=config)
+    else:
+        pin_memory = True
+        persistent_workers = True
+    
+    train_dataset = CoralSegmentationDataset(ds["train"], transform=transform, pre_compute=True, split="train", config=config)
+    val_dataset = CoralSegmentationDataset(ds["validation"], transform=transform, pre_compute=True, split="validation", config=config)
+    test_dataset = CoralSegmentationDataset(ds["test"], transform=transform, pre_compute=True, split="test", config=config)
     
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        pin_memory=pin_memory
     )
     val_dataloader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        pin_memory=pin_memory
     )
     test_dataloader = DataLoader(
         test_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        pin_memory=pin_memory
     )
     
     return train_dataloader, val_dataloader, test_dataloader
@@ -149,9 +256,11 @@ if __name__ == "__main__":
             masks = masks.to(device)
 
             # Augmentation
-            augmented = augment_transform({"image": images, "mask": masks})
-            images = augmented["image"]
-            masks = augmented["mask"].float()
+            images = augment_img(images)
+            masks = augment_mask(masks)
+
+            if processor is not None:
+                inputs = processor(images=images, return_tensors="pt").to(device)
 
         print(f"image shape: {images.shape}")
         print(f"image min: {images.min().item():.4f}, image max: {images.max().item():.4f}, image mean: {images.mean().item():.4f}, image std: {images.std().item():.4f}")

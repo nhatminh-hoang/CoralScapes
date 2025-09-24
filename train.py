@@ -1,9 +1,8 @@
 import os
+import argparse
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import pytorch_lightning as pl
@@ -11,30 +10,108 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from torchmetrics.segmentation import MeanIoU
 
-from model import UNet
+from model import get_model_and_processor
+from utils import get_loss_fn, calculate_pixel_accuracy
 from utils import get_free_vram
-from utils import ds, num_classes, id2label, label2color
-from utils import CoralSegmentationDataset, train_transform, val_transform, augment_transform
-from utils import training_curve, visualize_predictions_with_gt, calculate_pixel_accuracy
+from utils import ds, id2label, label2color
+from utils import CoralSegmentationDataset, create_augmentation_transforms
+from utils import create_traditional_plots
+from utils import visualize_test_predictions, create_class_colormap_figure
+from utils import load_config, Config
+from utils import DEFAULT_ARGS
+from utils.dataloader import make_transform
+from utils import ds
+
+# Custom visualization callback
+class VisualizationCallback(pl.Callback):
+    def __init__(self, log_dir, config):
+        self.log_dir = log_dir
+        self.config = config
+        self.best_metric = -float('inf') if DEFAULT_ARGS['checkpoint_mode'] == 'max' else float('inf')
+        
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Get current metric
+        current_metric = trainer.logged_metrics.get(DEFAULT_ARGS['checkpoint_monitor'], None)
+        if current_metric is None:
+            return
+            
+        # Check if this is a new best
+        is_better = (DEFAULT_ARGS['checkpoint_mode'] == 'max' and current_metric > self.best_metric) or \
+                    (DEFAULT_ARGS['checkpoint_mode'] == 'min' and current_metric < self.best_metric)
+        
+        if is_better:
+            self.best_metric = current_metric
+            print(f"🎯 New best {DEFAULT_ARGS['checkpoint_monitor']}: {current_metric:.4f}")
+            
+            # Generate visualizations
+            self._generate_visualizations(pl_module)
+    
+    def _generate_visualizations(self, pl_module):
+        """Generate test predictions visualization."""
+
+        transform = make_transform(resize_size=self.config.dataset.input_size, config=self.config)
+        test_dataset = CoralSegmentationDataset(ds["test"], transform=transform, split="test", config=self.config)
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=8,
+            shuffle=False,
+            num_workers=DEFAULT_ARGS['num_workers'],
+            persistent_workers=DEFAULT_ARGS['persistent_workers'],
+            pin_memory=DEFAULT_ARGS['pin_memory']
+        )
+        
+        # Generate visualization
+        visualize_test_predictions(
+            model=pl_module,
+            test_dataloader=test_dataloader,
+            device=pl_module.device,
+            save_path=f"{self.log_dir}/test_predictions_best.png",
+            num_samples=5
+        )
+        
+        # Generate class colormap (only once)
+        colormap_path = f"{self.log_dir}/class_colormap.png"
+        if not os.path.exists(colormap_path):
+            create_class_colormap_figure(save_path=colormap_path)
+        
+        print("✅ Visualizations updated!")
 
 class CoralSegmentationLightningModule(pl.LightningModule):
-    def __init__(self, in_channels=3, out_channels=40, init_features=64, learning_rate=1e-4, model_name="UNet", batch_size=64):
+    def __init__(self, config: Config):
         super().__init__()
         self.save_hyperparameters()
         
-        # Model
-        self.model = UNet(in_channels=in_channels, out_channels=out_channels, init_features=init_features)
+        self.config = config
         
+        # Set up model parameters from config
+        if config.model.name == "UNet":
+            model_config = config.model.unet
+            model_config.out_channels = config.dataset.num_classes
+        elif config.model.name == "DINOv3":
+            model_config = config.model.dinov3
+            model_config.num_labels = config.dataset.num_classes
+
+        # Model
+        self.model, self.processor = get_model_and_processor(
+            config.model.name, 
+            model_config, 
+            pretrained_model_name=getattr(model_config, 'pretrained_model_name', None),
+            num_labels=config.dataset.num_classes
+        )
+
         # Loss function
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = get_loss_fn(config.training.loss.name, config.training.loss.params)
 
         # Metrics
-        self.miou_metric = MeanIoU(num_classes=num_classes)
+        self.miou_metric = MeanIoU(num_classes=config.dataset.num_classes)
         
         # Hyperparameters
-        self.learning_rate = learning_rate
-        self.model_name = model_name
-        self.batch_size = batch_size
+        self.learning_rate = config.training.learning_rate
+        self.model_name = config.model.name
+        self.batch_size = config.training.batch_size
+        
+        # Create augmentation transforms from config
+        self.augment_img, self.augment_mask = create_augmentation_transforms(config)
         
         # Metrics tracking for direct saving
         self.train_losses = []
@@ -53,13 +130,57 @@ class CoralSegmentationLightningModule(pl.LightningModule):
         return self.model(x)
     
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate)
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=2)
+        """Configure optimizers and schedulers."""
+        # Optimizer
+        if self.config.training.optimizer.name == "Adam":
+            optimizer = optim.Adam(
+                self.model.parameters(), 
+                lr=self.config.training.optimizer.lr,
+                weight_decay=self.config.training.optimizer.weight_decay
+            )
+        elif self.config.training.optimizer.name == "AdamW":
+            optimizer = optim.AdamW(
+                self.model.parameters(), 
+                lr=self.config.training.optimizer.lr,
+                weight_decay=self.config.training.optimizer.weight_decay
+            )
+        elif self.config.training.optimizer.name == "SGD":
+            optimizer = optim.SGD(
+                self.model.parameters(), 
+                lr=self.config.training.optimizer.lr,
+                momentum=getattr(self.config.training.optimizer, 'momentum', 0.9),
+                weight_decay=self.config.training.optimizer.weight_decay
+            )
+        else:
+            optimizer = optim.Adam(self.model.parameters(), lr=self.config.training.optimizer.lr)
+        
+        # Scheduler
+        if self.config.training.scheduler.name == "CosineAnnealingWarmRestarts":
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, 
+                T_0=self.config.training.scheduler.T_0,
+                T_mult=self.config.training.scheduler.T_mult,
+                eta_min=self.config.training.scheduler.eta_min
+            )
+        elif self.config.training.scheduler.name == "StepLR":
+            scheduler = optim.lr_scheduler.StepLR(
+                optimizer, 
+                step_size=getattr(self.config.training.scheduler, 'step_size', 30),
+                gamma=getattr(self.config.training.scheduler, 'gamma', 0.1)
+            )
+        elif self.config.training.scheduler.name == "ExponentialLR":
+            scheduler = optim.lr_scheduler.ExponentialLR(
+                optimizer, 
+                gamma=getattr(self.config.training.scheduler, 'gamma', 0.95)
+            )
+        else:
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=2)
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_miou",
+                "monitor": DEFAULT_ARGS['checkpoint_monitor'],
                 "frequency": 1
             }
         }
@@ -67,16 +188,18 @@ class CoralSegmentationLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         images, masks = batch
 
-        augmented = augment_transform({"image": images, "mask": masks})
-        images = augmented["image"]
-        masks = augmented["mask"]
+        images = self.augment_img(images)
+        masks = self.augment_mask(masks)
+
+        if self.processor is not None:
+            images = self.processor(images=images, return_tensors="pt")
 
         outputs = self.forward(images)
 
         # Handle mask format - masks should be class indices for CrossEntropyLoss
         if len(masks.shape) == 4:
             masks = masks.squeeze(1)  # Remove channel dimension if present
-        masks = masks.long()
+        masks = masks.long().contiguous()
         
         loss = self.criterion(outputs, masks)
         
@@ -107,12 +230,16 @@ class CoralSegmentationLightningModule(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         images, masks = batch
+
+        if self.processor is not None:
+            images = self.processor(images=images, return_tensors="pt")
+                
         outputs = self.forward(images)
         
         # Handle mask format - masks should be class indices for CrossEntropyLoss
         if len(masks.shape) == 4:
             masks = masks.squeeze(1)  # Remove channel dimension if present
-        masks = masks.long()
+        masks = masks.long().contiguous()
         
         loss = self.criterion(outputs, masks)
         
@@ -153,6 +280,10 @@ class CoralSegmentationLightningModule(pl.LightningModule):
         self.train_mious.append(epoch_miou.cpu())
         self.train_accuracies.append(epoch_accuracy)
         self.learning_rates.append(epoch_lr)
+        
+        # Print epoch summary
+        current_epoch = self.current_epoch + 1
+        print(f"Epoch {current_epoch:3d} - Training - Loss: {epoch_loss:.4f}, mIoU: {epoch_miou:.4f}, Accuracy: {epoch_accuracy:.4f}, LR: {epoch_lr:.2e}")
         
         # Clear for next epoch
         self.train_step_outputs.clear()
@@ -199,109 +330,118 @@ class CoralSegmentationLightningModule(pl.LightningModule):
 
     def train_dataloader(self):
         """Create train dataloader."""
-        train_dataset = CoralSegmentationDataset(ds["train"], transform=train_transform)
+        transform = make_transform(resize_size=self.config.dataset.input_size, config=self.config)
+        train_dataset = CoralSegmentationDataset(ds["train"], transform=transform, pre_compute=True, split="train", config=self.config)
         return DataLoader(
             train_dataset, 
             batch_size=self.batch_size, 
             shuffle=True, 
-            num_workers=2,
-            persistent_workers=True
+            num_workers=DEFAULT_ARGS['num_workers'],
+            persistent_workers=DEFAULT_ARGS['persistent_workers'],
+            pin_memory=DEFAULT_ARGS['pin_memory']
         )
     
     def val_dataloader(self):
         """Create validation dataloader."""
-        val_dataset = CoralSegmentationDataset(ds["validation"], transform=val_transform)
+        transform = make_transform(resize_size=self.config.dataset.input_size, config=self.config)
+        val_dataset = CoralSegmentationDataset(ds["validation"], transform=transform, pre_compute=True, split="validation", config=self.config)
         return DataLoader(
             val_dataset, 
             batch_size=self.batch_size, 
             shuffle=False, 
-            num_workers=2,
-            persistent_workers=True
+            num_workers=DEFAULT_ARGS['num_workers'],
+            persistent_workers=DEFAULT_ARGS['persistent_workers'],
+            pin_memory=DEFAULT_ARGS['pin_memory']
         )
     
     def test_dataloader(self):
         """Create test dataloader."""
-        test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform)
+        transform = make_transform(resize_size=self.config.dataset.input_size, config=self.config)
+        test_dataset = CoralSegmentationDataset(ds["test"], transform=transform, pre_compute=True, split="test", config=self.config)
         return DataLoader(
             test_dataset, 
             batch_size=self.batch_size, 
             shuffle=False, 
-            num_workers=2,
-            persistent_workers=True
+            num_workers=DEFAULT_ARGS['num_workers'],
+            persistent_workers=DEFAULT_ARGS['persistent_workers'],
+            pin_memory=DEFAULT_ARGS['pin_memory']
         )
 
-def train_lightning_model(
-    in_channels=3,
-    out_channels=40,
-    init_features=64,
-    learning_rate=1e-4,
-    batch_size=64,
-    num_epochs=200,
-    model_name="UNet"
-):
-    """Train the model using PyTorch Lightning."""
+def train_lightning_model(config_path: str = "config/base_config.yaml"):
+    """Train the model using PyTorch Lightning with config file."""
+    
+    # Load configuration
+    config = load_config(config_path)
+    
     torch.set_float32_matmul_precision('high')
 
-    # Create log directory
-    log_dir = f"logs/{model_name}_features{init_features}_batch{batch_size}_epochs{num_epochs}_lr{learning_rate}"
+    # Create log directory using hardcoded defaults
+    log_dir = f"{DEFAULT_ARGS['save_dir']}/{config.model.name}/{config.logging['experiment_name']}"
     os.makedirs(log_dir, exist_ok=True)
 
-    while get_free_vram()[0] < 10000 and torch.cuda.is_available():
-        print("Waiting for GPU memory...")
-        torch.cuda.empty_cache()
-        import time
-        time.sleep(300)
+    # GPU memory check using hardcoded threshold
+    if torch.cuda.is_available() and DEFAULT_ARGS['gpu_memory_threshold'] > 0:
+        while get_free_vram()[0] < DEFAULT_ARGS['gpu_memory_threshold']:
+            print("Waiting for GPU memory...")
+            torch.cuda.empty_cache()
+            import time
+            time.sleep(300)
     
     # Initialize the Lightning module
-    model = CoralSegmentationLightningModule(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        init_features=init_features,
-        learning_rate=learning_rate,
-        model_name=model_name,
-        batch_size=batch_size
-    )
+    model = CoralSegmentationLightningModule(config=config)
 
-    # Callbacks
+    # Callbacks with hardcoded defaults
     checkpoint_callback = ModelCheckpoint(
         dirpath=log_dir,
-        filename='best_model',
-        monitor='val_miou',
-        mode='max',
-        save_top_k=1,
+        filename=DEFAULT_ARGS['checkpoint_filename'],
+        monitor=DEFAULT_ARGS['checkpoint_monitor'],
+        mode=DEFAULT_ARGS['checkpoint_mode'],
+        save_top_k=DEFAULT_ARGS['checkpoint_save_top_k'],
         verbose=True,
-        save_last=True
+        save_last=DEFAULT_ARGS['checkpoint_save_last']
     )
     
-    early_stopping = EarlyStopping(
-        monitor='val_miou',
-        mode='max',
-        patience=num_epochs // 2,
-        verbose=True
-    )
+    callbacks = [checkpoint_callback]
     
-    # Logger
-    logger = TensorBoardLogger(
-        save_dir=log_dir,
-        name="lightning_logs",
-        version=0
-    )
+    # Early stopping with hardcoded defaults
+    if DEFAULT_ARGS['early_stopping_enable']:
+        early_stopping = EarlyStopping(
+            monitor=DEFAULT_ARGS['early_stopping_monitor'],
+            mode=DEFAULT_ARGS['early_stopping_mode'],
+            patience=DEFAULT_ARGS['early_stopping_patience'],
+            verbose=True
+        )
+        callbacks.append(early_stopping)
     
-    # Trainer
+    # Logger with hardcoded defaults
+    if DEFAULT_ARGS['tensorboard_enable']:
+        logger = TensorBoardLogger(
+            save_dir=log_dir,
+            name="lightning_logs"
+        )
+    else:
+        logger = None
+
+    # Add visualization callback
+    visualization_callback = VisualizationCallback(logger.log_dir, config)
+    callbacks.append(visualization_callback)
+    
+    # Trainer with hardcoded defaults
     trainer = pl.Trainer(
-        max_epochs=num_epochs,
-        callbacks=[checkpoint_callback, early_stopping],
+        max_epochs=config.training.num_epochs,
+        callbacks=callbacks,
         logger=logger,
-        num_nodes=1,
-        precision='bf16-mixed' if torch.cuda.is_available() else 32,
-        log_every_n_steps=10,
-        val_check_interval=1.0,
-        check_val_every_n_epoch=1,
-        enable_progress_bar=True,
-        enable_model_summary=False,
+        accelerator=DEFAULT_ARGS['accelerator'],
+        devices=DEFAULT_ARGS['devices'],
+        precision=DEFAULT_ARGS['precision'] if torch.cuda.is_available() else 32,
+        log_every_n_steps=DEFAULT_ARGS['log_every_n_steps'],
+        check_val_every_n_epoch=DEFAULT_ARGS['check_val_every_n_epoch'],
+        enable_progress_bar=DEFAULT_ARGS['enable_progress_bar'],
+        enable_model_summary=DEFAULT_ARGS['enable_model_summary'],
+        enable_checkpointing=DEFAULT_ARGS['enable_checkpointing']
     )
     
-    print(f"Training {model_name} for {num_epochs} epochs...")
+    print(f"Training {config.model.name} for {config.training.num_epochs} epochs...")
     print(f"Logs will be saved to: {log_dir}")
     print(f"Using device: {trainer.device_ids if trainer.device_ids else 'CPU'}")
     
@@ -314,20 +454,15 @@ def train_lightning_model(
     # Load the best model
     best_model = CoralSegmentationLightningModule.load_from_checkpoint(
         checkpoint_callback.best_model_path,
-        in_channels=in_channels,
-        out_channels=out_channels,
-        init_features=init_features,
-        learning_rate=learning_rate,
-        model_name=model_name,
-        batch_size=batch_size
+        config=config
     )
     
     # Get metrics directly from the model
     metrics = model.get_metrics_dict()
     
     # Create traditional training curves and save metrics
-    if metrics and metrics['train_losses']:
-        create_traditional_plots(metrics, log_dir)
+    if DEFAULT_ARGS['save_training_curves'] and metrics and metrics['train_losses']:
+        create_traditional_plots(metrics, logger.log_dir)
     else:
         print("No metrics available for plotting")
     
@@ -335,75 +470,46 @@ def train_lightning_model(
     print(f"Best model saved to: {checkpoint_callback.best_model_path}")
     print(f"Best Validation mIoU: {metrics.get('best_miou', 0.0):.4f}")
     
-    return best_model, metrics, log_dir
-
-def create_traditional_plots(metrics, log_dir):
-    """Create traditional training curves using existing visualization function and save metrics."""
-    # Create training curves
-    training_curve(
-        metrics['train_losses'],
-        metrics['val_losses'],
-        metrics['train_mious'],
-        metrics['val_mious'],
-        metrics['train_accuracies'],
-        metrics['val_accuracies'],
-        metrics['learning_rates'],
-        save_path=f"{log_dir}/training_curves.png"
-    )
-    
-    # Save metrics for compatibility with existing README update system
-    torch.save(metrics, f"{log_dir}/training_metrics.pth")
-    print(f"Training metrics saved to {log_dir}/training_metrics.pth")
+    return best_model, metrics, log_dir, config
 
 if __name__ == "__main__":
     
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Train CoralScapes Segmentation Model')
+    parser.add_argument('--config', type=str, default='config/base_config.yaml',
+                       help='Path to config file (default: config/base_config.yaml)')
+    args = parser.parse_args()
 
-    # Hyperparameters
-    num_epochs = 1000
-    learning_rate = 1e-3
-    batch_size = 32
-    features = 64  # Initial number of features in UNet
-
-    # Model name for logging
-    model_name = f"UNet"
-
-    # Train the model using Lightning
-    trained_model, metrics, log_dir = train_lightning_model(
-        in_channels=3,
-        out_channels=num_classes,
-        init_features=features,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        num_epochs=num_epochs,
-        model_name=model_name
-    )
+    # Train the model using Lightning with config
+    trained_model, metrics, log_dir, config = train_lightning_model(config_path=args.config)
     
     print(f"\n✅ Training completed! Results saved in: {log_dir}")
     
-    # Generate prediction visualizations with ground truth comparison
-    print("📊 Generating prediction visualizations...")
+    # Generate final visualization summary
+    print("📊 Generating final test visualization summary...")
     
     # Set model to evaluation mode
     trained_model.eval()
-    
-    # Create test dataloader for visualization
-    test_dataset = CoralSegmentationDataset(ds["test"], transform=val_transform, split="test")
+
+    # Create test dataloader for final visualization
+    transform = make_transform(resize_size=config.dataset.input_size, config=config)
+    test_dataset = CoralSegmentationDataset(ds["test"], transform=transform, split="test", config=config)
     test_dataloader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=2,
-        persistent_workers=True
+        test_dataset,
+        batch_size=8,
+        shuffle=False,
+        num_workers=DEFAULT_ARGS['num_workers'],
+        persistent_workers=DEFAULT_ARGS['persistent_workers'],
+        pin_memory=DEFAULT_ARGS['pin_memory']
     )
     
-    visualize_predictions_with_gt(
-        model=trained_model.model,  # Extract the UNet model from Lightning module
-        dataloader=test_dataloader,
+    # Generate final visualization
+    visualize_test_predictions(
+        model=trained_model.model,
+        test_dataloader=test_dataloader,
         device=next(trained_model.parameters()).device,
-        num_samples=3,
-        save_path=f"{log_dir}/predictions_vs_gt.png",
-        id2label=id2label,
-        label2color=label2color
+        save_path=f"{log_dir}/final_test_predictions.png",
+        num_samples=5
     )
     
     # Automatically update README with best results
@@ -430,5 +536,4 @@ if __name__ == "__main__":
         print(f"⚠️  Error updating README: {e}")
     
     print("\n🎉 Lightning training complete!")
-    print(f"📁 Check TensorBoard logs: tensorboard --logdir {log_dir}/lightning_logs")
-    print("=" * 60)
+    print(f"📁 Check TensorBoard logs: tensorboard --logdir {log_dir}/lightning_logs")    # Automatically update README with best results

@@ -1,0 +1,75 @@
+# DINOv3 Configuration for CoralScapes Segmentation
+# This configuration is optimized for training DINOv3 model
+
+# Project
+project_name: "DINOv3_ConvNext_base"
+
+# Dataset Configuration
+dataset:
+  name: "CoralScapes"
+  input_size: [134, 262] # [height, width]
+  num_classes: 40
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+# Model Configuration
+model:
+  name: "DINOv3"
+  # UNet specific parameters (not used for DINOv3)
+  unet:
+    in_channels: 3
+    out_channels: 40
+    init_features: 64
+  
+  # DINOv3 specific parameters
+  dinov3:
+    pretrained_model_name: "facebook/dinov3-convnext-base-pretrain-lvd1689m"
+    hidden_size: 64
+    tokenW: 49
+    tokenH: 16
+
+# Training Configuration
+training:
+  num_epochs: 100  # DINOv3 typically needs fewer epochs
+  batch_size: 8    # Smaller batch size for DINOv3
+  learning_rate: 1e-3
+  
+  # Optimizer settings
+  optimizer:
+    name: "AdamW"
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+  
+  # Learning rate scheduler
+  scheduler:
+    name: "CosineAnnealingWarmRestarts"
+    T_0: 50
+    T_mult: 1
+    eta_min: 1e-7
+  
+  # Loss function
+  loss:
+    name: "cross_entropy+dice"
+    params:
+      weight_ce: 0.5  # Lower CE weight for DINOv3
+      weight_dice: 0.5  # Higher Dice weight for DINOv3
+
+# Data Augmentation (reduced for DINOv3)
+augmentation:
+  train:
+    enable: true
+    random_crop:
+      enable: true
+      size: [128, 128]
+    random_horizontal_flip:
+      enable: true
+      probability: 0.5
+    random_rotation:
+      enable: true
+      degrees: 15  # Reduced rotation
+    random_affine:
+      enable: true
+      probability: 0.3
+      degrees: 10
+      translate: [0.02, 0.02]

@@ -78,3 +78,7 @@ Thumbs.db
 
 # Documentation build
 docs/_build/
+
+sam2/
+readme_assets/
+update_readme.py

@@ -7,8 +7,6 @@
 #SBATCH --partition=gpu
 #SBATCH --gpus=1
 #SBATCH --nodelist=hpc24
-#SBATCH --cpus-per-task=20
-#SBATCH --mem-per-gpu=100G
 
 #SBATCH --output=train_outs/gpu/out/%x.%j.out
 #SBATCH --error=train_outs/gpu/errors/%x.%j.err
@@ -19,4 +17,12 @@ conda init bash
 source ~/.bashrc
 conda activate gpu_11.8
 
-srun python train.py
+srun python train.py --config config/dinov3_convnext_tiny.yaml
+srun python train.py --config config/dinov3_convnext_small.yaml
+srun python train.py --config config/dinov3_convnext_base.yaml
+srun python train.py --config config/dinov3_convnext_large.yaml
+
+srun python train.py --config config/dinov3_vits16.yaml
+srun python train.py --config config/dinov3_vitb16.yaml
+srun python train.py --config config/dinov3_vits16plus.yaml
+srun python train.py --config config/dinov3_vitl16.yaml
